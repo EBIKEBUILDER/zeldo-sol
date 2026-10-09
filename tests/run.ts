@@ -1,5 +1,13 @@
 import './audio.test';
+import './music.test';
+import './music-audio.test';
+import './automatic-portals.test';
+import './preview-session.test';
+import './boss-attacks.test';
 import './simulation.test';
 import './sword.test';
 import './pathfinding.test';
 import './gameplay-upgrades.test';
+import './navigation-integration.test';
+import './enemy-facing.test';
+import './leash-return.test';

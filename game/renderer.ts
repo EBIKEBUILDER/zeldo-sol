@@ -8,7 +8,9 @@ import {
 import { useGameStore } from './store';
 import { getWorld } from './world';
 import { getSwordSweep } from './swordMotion';
-import type { Effect, Enemy, GameStore, Pickup, Projectile, WorldObject, Zone } from './types';
+import { getEnemyYaw } from './enemyMotion';
+import { BOSS_BLAST_RADIUS, BOSS_BLAST_SPREAD, BOSS_CHARGE_DURATION, BOSS_CHARGE_SPEED, BOSS_CHARGE_TELEGRAPH, BOSS_TELEGRAPH } from './simulation';
+import type { Effect, Enemy, GameStore, Hazard, Pickup, Projectile, WorldObject, Zone } from './types';
 
 export interface RenderStatistics { drawCalls: number; activeMeshes: number; triangles: number; }
 
@@ -85,6 +87,7 @@ export function createGameRenderer(canvas: HTMLCanvasElement) {
   const frozenMaterials = new Set<StandardMaterial>();
   let zoneRoot: TransformNode | null = null;
   let activeZone: Zone | null = null;
+  let activeTileOverrides: GameStore['tileOverrides'][Zone];
   let clock = 0;
   let torchLights: PointLight[] = [];
   let flames: Mesh[] = [];
@@ -128,10 +131,10 @@ export function createGameRenderer(canvas: HTMLCanvasElement) {
     mesh.rotation.set(random(x, z) * .4, random(z, x) * 6.28, random(x + 7, z) * .5);
     return finish(mesh, material, parent, cast, stat);
   }
-  function sphere(name: string, size: number, x: number, y: number, z: number, material: StandardMaterial, parent: TransformNode, cast = false) {
-    const mesh = MeshBuilder.CreateSphere(`${name}-${serial++}`, { diameter: size, segments: 10 }, scene);
+  function sphere(name: string, size: number, x: number, y: number, z: number, material: StandardMaterial, parent: TransformNode, cast = false, smooth = false) {
+    const mesh = MeshBuilder.CreateSphere(`${name}-${serial++}`, { diameter: size, segments: smooth ? 16 : 10 }, scene);
     mesh.position.set(x, y, z);
-    mesh.convertToFlatShadedMesh();
+    if (!smooth) mesh.convertToFlatShadedMesh();
     return finish(mesh, material, parent, cast, false);
   }
   function blade(x: number, z: number, size: number, angle: number, material: StandardMaterial, parent: TransformNode | null = zoneRoot, stat = true, leafy = false) {
@@ -309,11 +312,17 @@ export function createGameRenderer(canvas: HTMLCanvasElement) {
         gate.parent = zoneRoot;
         gate.position.set(o.x, 0, o.z);
         const iron = mat('gate-iron', '#667363');
-        for (let i = -2; i <= 2; i++) {
-          cylinder('gate-bar', .13, .13, 2.50, 5, i * .67, 1.25, 0, iron, gate, true, false);
-          cylinder('gate-point', 0, .27, .35, 5, i * .67, 2.66, 0, mat('gate-gold', '#b2a16b'), gate, true, false);
+        const gateWidth = o.solid && 'w' in o.solid ? o.solid.w : 5.2;
+        const jambWidth = .26;
+        const openingWidth = gateWidth - jambWidth;
+        // Jambs overlap the existing wall ends; the entire doorway remains clear when the bars lower.
+        for (const side of [-1, 1]) box('gate-jamb', jambWidth, 2.85, 1.24, o.x + side * gateWidth / 2, 1.425, o.z, mat('gate-jamb', '#68736a'), zoneRoot, true);
+        for (let i = -4; i <= 4; i++) {
+          const x = i * openingWidth / 8;
+          cylinder('gate-bar', .13, .13, 2.50, 5, x, 1.25, 0, iron, gate, true, false);
+          cylinder('gate-point', 0, .27, .35, 5, x, 2.66, 0, mat('gate-gold', '#b2a16b'), gate, true, false);
         }
-        for (const y of [.65, 1.8]) box('gate-crossbar', 3.24, .16, .19, 0, y, 0, iron, gate, true, false);
+        for (const y of [.65, 1.8]) box('gate-crossbar', gateWidth, .16, .19, 0, y, 0, iron, gate, true, false);
         box('gate-lock', .42, .51, .32, 0, 1.3, -.14, mat('gate-lock', '#bd9f55'), gate, true, false);
         box('gate-keyhole', .07, .18, .02, 0, 1.33, -.31, mat('keyhole', '#37493d'), gate, false, false);
         break;
@@ -325,16 +334,18 @@ export function createGameRenderer(canvas: HTMLCanvasElement) {
         const flame = rock('torch-flame', o.x, 1.55, o.z, .15, .35, .15, mat('flame', '#ffc464', 1.5), zoneRoot, false, false);
         flames.push(flame);
         rock('flame-heart', o.x, 1.43, o.z - .02, .11, .17, .1, mat('flame-core', '#ffe7a0', 2), zoneRoot, false);
-        if (torchLights.length < 6) {
-          const light = new PointLight(`torchlight-${o.id}`, new Vector3(o.x, 2.0, o.z), scene);
-          light.diffuse = Color3.FromHexString('#ffbb70');
-          light.intensity = 2.0;
-          light.range = 8;
-          torchLights.push(light);
+        if (dungeon) {
+          if (torchLights.length < 6) {
+            const light = new PointLight(`torchlight-${o.id}`, new Vector3(o.x, 2.0, o.z), scene);
+            light.diffuse = Color3.FromHexString('#ffbb70');
+            light.intensity = 2.0;
+            light.range = 8;
+            torchLights.push(light);
+          }
+          // The warm pool is visible even on inexpensive GPUs that limit active lights.
+          const pool = cylinder('torch-pool', 3.5, 3.5, .015, 32, o.x, .037, o.z, mat('torch-glow', '#b69151', .35, .12), zoneRoot, false, false);
+          pool.receiveShadows = false;
         }
-        // The warm pool is visible even on inexpensive GPUs that limit active lights.
-        const pool = cylinder('torch-pool', 3.5, 3.5, .015, 32, o.x, .037, o.z, mat('torch-glow', '#b69151', .35, .12), zoneRoot, false, false);
-        pool.receiveShadows = false;
         break;
       }
       case 'pedestal':
@@ -387,7 +398,7 @@ export function createGameRenderer(canvas: HTMLCanvasElement) {
     }
   }
 
-  function buildZone(zone: Zone) {
+  function buildZone(zone: Zone, tileOverrides: GameStore['tileOverrides']) {
     for (const material of frozenMaterials) material.unfreeze();
     frozenMaterials.clear();
     if (zoneRoot) {
@@ -406,7 +417,8 @@ export function createGameRenderer(canvas: HTMLCanvasElement) {
     staticCasters = new Set();
     zoneRoot = new TransformNode(`world-${zone}`, scene);
     activeZone = zone;
-    const world = getWorld(zone);
+    activeTileOverrides = tileOverrides[zone];
+    const world = getWorld(zone, tileOverrides);
     const dungeon = zone === 'dungeon';
     scene.clearColor = Color4.FromHexString(dungeon ? '#22372fff' : '#829270ff');
     sky.intensity = dungeon ? .54 : .60;
@@ -565,22 +577,48 @@ export function createGameRenderer(canvas: HTMLCanvasElement) {
   const swordPoint = cylinder('sword-point', 0, .085, .11, 4, 0, .75, 0, mat('sword-steel', '#d7e1d9', .10), swordRoot, false, false);
   swordPoint.scaling.z = .4;
 
-  type EnemyVisual = { root: TransformNode; body: Mesh; eyes: Mesh[]; normal: StandardMaterial; tell?: Mesh; aim?: TransformNode; line?: Mesh; marker?: Mesh; orb?: Mesh; fan?: Mesh[] };
+  type GroundMarker = { root: TransformNode; fill: Mesh; ring: Mesh };
+  type EnemyVisual = { root: TransformNode; body: Mesh; eyes: Mesh[]; normal: StandardMaterial; tell?: Mesh; aim?: TransformNode; line?: Mesh; targets?: GroundMarker[]; orb?: Mesh; chargeAim?: TransformNode; corridor?: Mesh; arrows?: Mesh[]; guard?: Mesh };
+  type ProjectileVisual = { root: TransformNode; body: TransformNode; landing?: GroundMarker; shadow?: Mesh };
   const enemyVisuals = new Map<string, EnemyVisual>();
   const breakableVisuals = new Map<string, TransformNode>();
   const pickupVisuals = new Map<string, TransformNode>();
-  const projectileVisuals = new Map<string, TransformNode>();
-  const effectVisuals = new Map<string, { root: TransformNode; pieces: Mesh[]; kind: Effect['kind'] }>();
+  const projectileVisuals = new Map<string, ProjectileVisual>();
+  const hazardVisuals = new Map<string, GroundMarker & { embers: Mesh[] }>();
+  const effectVisuals = new Map<string, { root: TransformNode; pieces: Mesh[]; kind: Effect['kind']; flare?: GroundMarker }>();
   let stateZone: Zone | null = null;
   const flashMat = mat('enemy-hit-white', '#fff0ca', .65);
+
+  function groundMarker(name: string, radius: number, color: string, parent: TransformNode | null, opacity = .38, rimColor = color): GroundMarker {
+    const root = new TransformNode(`${name}-${serial++}`, scene);
+    root.parent = parent;
+    root.scaling.set(radius, 1, radius);
+    const fill = cylinder(`${name}-fill`, 2, 2, .012, 48, 0, .052, 0, mat(`${name}-fill`, color, .35, opacity), root, false, false);
+    // The torus's outer edge is exactly unit radius, so it matches the damaging area.
+    const ring = MeshBuilder.CreateTorus(`${name}-rim`, { diameter: 1.94, thickness: .06, tessellation: 48 }, scene);
+    ring.position.y = .072;
+    finish(ring, mat(`${name}-rim`, rimColor, .55, .95), root, false, false);
+    return { root, fill, ring };
+  }
 
   function jellyBody(size: number, seed: number, material: StandardMaterial, parent: TransformNode) {
     const mesh = new Mesh(`jelly-body-${serial++}`, scene);
     const data = new VertexData();
     const positions: number[] = [], indices: number[] = [], normals: number[] = [];
-    const rings = [[.03, .0], [.055, .50], [.16, .56], [.37, .52], [.60, .42], [.77, .27], [.85, .095], [.865, .0]];
-    const sides = 16;
-    for (const [height, radius] of rings) {
+    const profile = [[.03, .0], [.055, .50], [.16, .56], [.37, .52], [.60, .42], [.77, .27], [.85, .095], [.865, .0]]
+      .map(([height, radius]) => new Vector3(radius, height, 0));
+    // Round the contour between its original landmarks, preserving the jelly's shape.
+    const rings = [profile[0]];
+    for (let ring = 0; ring < profile.length - 1; ring++) {
+      for (let step = 1; step <= 4; step++) {
+        rings.push(Vector3.CatmullRom(profile[Math.max(0, ring - 1)], profile[ring],
+          profile[ring + 1], profile[Math.min(profile.length - 1, ring + 2)], step / 4));
+      }
+    }
+    const sides = size > 1 ? 48 : 32;
+    // Each cap has one shared vertex so lighting blends across the entire pole.
+    positions.push(profile[0].y ** 2 * .19 * size, profile[0].y * size, profile[0].y ** 2 * .19 * .35 * size);
+    for (const { x: radius, y: height } of rings.slice(1, -1)) {
       for (let i = 0; i < sides; i++) {
         const angle = i / sides * Math.PI * 2;
         const skirt = 1 - height / .865;
@@ -591,16 +629,23 @@ export function createGameRenderer(canvas: HTMLCanvasElement) {
           (Math.sin(angle) * radius * wobble * .91 + drift * .35) * size);
       }
     }
-    for (let ring = 0; ring < rings.length - 1; ring++) {
+    const top = positions.length / 3;
+    const topHeight = profile[profile.length - 1].y;
+    positions.push(topHeight ** 2 * .19 * size, topHeight * size, topHeight ** 2 * .19 * .35 * size);
+    const lastRing = 1 + (rings.length - 3) * sides;
+    for (let side = 0; side < sides; side++) {
+      const next = (side + 1) % sides;
+      indices.push(0, 1 + next, 1 + side, lastRing + side, lastRing + next, top);
+    }
+    for (let ring = 0; ring < rings.length - 3; ring++) {
       for (let side = 0; side < sides; side++) {
-        const a = ring * sides + side, b = ring * sides + (side + 1) % sides;
+        const a = 1 + ring * sides + side, b = 1 + ring * sides + (side + 1) % sides;
         indices.push(a, b, a + sides, b, b + sides, a + sides);
       }
     }
     VertexData.ComputeNormals(positions, indices, normals);
     data.positions = positions; data.indices = indices; data.normals = normals;
     data.applyToMesh(mesh);
-    // Smooth jelly faces and an irregular low-poly silhouette avoid the old golf-ball facets.
     return finish(mesh, material, parent, true, false);
   }
   function makeEnemy(enemy: Enemy): EnemyVisual {
@@ -613,21 +658,21 @@ export function createGameRenderer(canvas: HTMLCanvasElement) {
     const faceZ = enemy.boss ? -.99 : -.43;
     const faceY = enemy.boss ? 1.03 : .46;
     const eyes: Mesh[] = [];
-    let tell: Mesh | undefined, line: Mesh | undefined, marker: Mesh | undefined, orb: Mesh | undefined;
-    let aim: TransformNode | undefined;
-    const fan: Mesh[] = [];
+    let tell: Mesh | undefined, line: Mesh | undefined, orb: Mesh | undefined, corridor: Mesh | undefined, guard: Mesh | undefined;
+    let aim: TransformNode | undefined, chargeAim: TransformNode | undefined;
+    const targets: GroundMarker[] = [], arrows: Mesh[] = [];
     for (const x of [-1, 1]) {
-      const eye = sphere('monster-eye-white', enemy.boss ? .30 : .18, x * (enemy.boss ? .39 : .19), faceY + (x === 1 ? .025 : 0), faceZ, mat('monster-eye', '#eae5c4'), body);
+      const eye = sphere('monster-eye-white', enemy.boss ? .30 : .18, x * (enemy.boss ? .39 : .19), faceY + (x === 1 ? .025 : 0), faceZ, mat('monster-eye', '#eae5c4'), body, false, true);
       eye.scaling.set(1, 1.10, .52);
-      const pupil = sphere('monster-pupil', enemy.boss ? .15 : .082, x * (enemy.boss ? .39 : .19), faceY -.008, faceZ - .079, mat('monster-pupil', '#243e32'), body);
+      const pupil = sphere('monster-pupil', enemy.boss ? .15 : .082, x * (enemy.boss ? .39 : .19), faceY -.008, faceZ - .079, mat('monster-pupil', '#243e32'), body, false, true);
       pupil.scaling.set(.83, 1.14, .40);
       eyes.push(eye, pupil);
       if (!enemy.boss) {
-        const cheek = sphere('jelly-cheek', .09, x * .31, faceY -.12, faceZ + .016, mat('jelly-cheek', '#e69387'), body);
+        const cheek = sphere('jelly-cheek', .09, x * .31, faceY -.12, faceZ + .016, mat('jelly-cheek', '#e69387'), body, false, true);
         cheek.scaling.set(1.15, .44, .24);
       }
     }
-    sphere('monster-mouth', enemy.boss ? .21 : .095, .025, faceY - (enemy.boss ? .24 : .15), faceZ - .01, mat('monster-mouth', '#593348'), body).scaling.set(1.3, .45, .4);
+    sphere('monster-mouth', enemy.boss ? .21 : .095, .025, faceY - (enemy.boss ? .24 : .15), faceZ - .01, mat('monster-mouth', '#593348'), body, false, true).scaling.set(1.3, .45, .4);
     if (enemy.boss) {
       const crown = new TransformNode('keeper-crown', scene);
       crown.parent = body;
@@ -646,31 +691,39 @@ export function createGameRenderer(canvas: HTMLCanvasElement) {
       }
       tell = MeshBuilder.CreateTorus('warden-charge-warning', { diameter: 3.1, thickness: .055, tessellation: 32 }, scene);
       tell.position.y = .063;
-      finish(tell, mat('charge-warning', '#ffd07c', .85), root, false, false);
+      finish(tell, mat('charge-warning', '#ff6c20', .5), root, false, false);
       tell.setEnabled(false);
       aim = new TransformNode('warden-aim-warning', scene);
       aim.parent = root;
-      const magic = mat('warden-magic-warning', '#f7a569', .8, .68);
-      line = box('warden-aim-line', .10, .013, 1, 0, .085, 0, magic, aim, false, false);
-      for (const angle of [-.22, .22]) {
-        const ray = box('warden-fan-aim', .065, .013, 1, 0, .085, 0, magic, aim, false, false);
-        ray.rotation.y = angle;
-        ray.setEnabled(false);
-        fan.push(ray);
-      }
-      marker = MeshBuilder.CreateTorus('warden-target-warning', { diameter: .95, thickness: .055, tessellation: 24 }, scene);
-      marker.position.y = .09;
-      finish(marker, magic, aim, false, false);
+      const magic = mat('warden-magic-warning', '#f7a569', .8, .45);
+      line = box('warden-aim-line', .065, .013, 1, 0, .085, 0, magic, aim, false, false);
+      for (let i = 0; i < 3; i++) targets.push(groundMarker('warden-landing-warning', BOSS_BLAST_RADIUS, '#f56013', aim));
       orb = sphere('warden-charged-magic', .34, 0, 1.13, -1.19, mat('warden-magic-core', '#ffd391', 1.1), body);
+      chargeAim = new TransformNode('warden-lunge-warning', scene);
+      chargeAim.parent = root;
+      const chargeLength = BOSS_CHARGE_SPEED * BOSS_CHARGE_DURATION;
+      corridor = box('warden-lunge-corridor', 1.66, .012, chargeLength, 0, .066, chargeLength / 2, mat('warden-lunge-area', '#eb5a12', .45, .50), chargeAim, false, false);
+      for (const side of [-1, 1]) box('warden-lunge-edge', .045, .012, chargeLength, side * .83, .078, chargeLength / 2, mat('warden-lunge-edge', '#ff6519', .55, .90), chargeAim, false, false);
+      const endpoint = groundMarker('warden-lunge-end', .83, '#f56013', chargeAim, .20);
+      endpoint.root.position.z = chargeLength;
+      for (const z of [.75, 1.5, 2.25]) for (const side of [-1, 1]) {
+        const arrow = box('warden-lunge-arrow', .075, .013, .40, side * .135, .094, z - .135, mat('warden-lunge-arrow', '#ffe9ac', 1.2), chargeAim, false, false);
+        arrow.rotation.y = -side * Math.PI / 4;
+        arrows.push(arrow);
+      }
+      guard = sphere('warden-charge-guard', 2.65, .18, 1.03, .05, mat('warden-charge-guard', '#ffd186', .9, .16), root, false, true);
+      guard.scaling.y = .82;
       aim.setEnabled(false);
+      chargeAim.setEnabled(false);
       orb.setEnabled(false);
+      guard.setEnabled(false);
     } else {
       const leaf = cylinder('monster-sprout', 0, .20, .34, 5, .10, .94, -.02, mat('sprout', '#266a3c'), body, true, false);
       leaf.rotation.z = -.55;
       const sideLeaf = cylinder('monster-side-leaf', 0, .16, .28, 5, .22, .86, -.02, mat('sprout', '#266a3c'), body, true, false);
       sideLeaf.rotation.z = -1.2;
     }
-    return { root, body, eyes, normal, tell, aim, line, marker, orb, fan };
+    return { root, body, eyes, normal, tell, aim, line, targets, orb, chargeAim, corridor, arrows, guard };
   }
   function batchProp(root: TransformNode) {
     const groups = new Map<StandardMaterial, Mesh[]>();
@@ -738,21 +791,40 @@ export function createGameRenderer(canvas: HTMLCanvasElement) {
     batchProp(root);
     return root;
   }
-  function makeProjectile(projectile: Projectile) {
+  function makeProjectile(projectile: Projectile): ProjectileVisual {
     const root = new TransformNode(`projectile-${projectile.id}`, scene);
-    const core = sphere('magic-bolt-core', projectile.radius * 1.4, 0, 0, 0, mat('magic-core', '#ffe3b0', 1.1), root);
-    const shell = sphere('magic-bolt-shell', projectile.radius * 2.35, 0, 0, 0, mat('magic-shell', '#d870ac', .65, .55), root);
+    const body = new TransformNode('magic-bolt-flight', scene);
+    body.parent = root;
+    const core = sphere('magic-bolt-core', projectile.radius * 1.4, 0, 0, 0, mat('magic-core', '#ffe3b0', 1.1), body, false, true);
+    const shell = sphere('magic-bolt-shell', projectile.radius * 2.35, 0, 0, 0, mat('magic-shell', '#ed9e69', .8, .55), body, false, true);
     shell.scaling.z = 1.15;
     for (let i = 0; i < 3; i++) {
-      const trail = sphere('magic-bolt-trail', projectile.radius * (.9 - i * .22), 0, 0, -(i + 1) * .20, mat('magic-trail', '#e998be', .7, .48 - i * .10), root);
+      const trail = sphere('magic-bolt-trail', projectile.radius * (.9 - i * .22), 0, 0, -(i + 1) * .20, mat('magic-trail', '#ffd09a', .7, .48 - i * .10), body, false, true);
       trail.scaling.z = 1.35;
     }
     core.rotation.z = Math.PI / 4;
-    return root;
+    const targeted = projectile.flightTime !== undefined && projectile.targetX !== undefined && projectile.targetZ !== undefined;
+    const landing = targeted ? groundMarker('magic-bolt-landing', BOSS_BLAST_RADIUS, '#f56013', root, .32) : undefined;
+    const shadow = targeted ? cylinder('magic-bolt-shadow', .50, .50, .010, 24, 0, .034, 0, mat('magic-bolt-shadow', '#32291f', 0, .26), root, false, false) : undefined;
+    return { root, body, landing, shadow };
+  }
+  function makeHazard(hazard: Hazard) {
+    const marker = groundMarker('burning-ember-area', hazard.radius, '#922607', null, .68, '#ff5e0e');
+    const embers: Mesh[] = [];
+    for (let i = 0; i < 6; i++) {
+      const angle = i / 6 * Math.PI * 2;
+      const distance = .30 + random(i, hazard.x) * .48;
+      const ember = cylinder('burning-ember-flame', 0, .16, .40, 4, Math.cos(angle) * distance, .26, Math.sin(angle) * distance, mat('burning-ember', i % 2 ? '#f65c0c' : '#ff9213', .45, .95), marker.root, false, false);
+      ember.scaling.z = .55;
+      ember.rotation.z = (i % 2 ? 1 : -1) * .18;
+      embers.push(ember);
+    }
+    return { ...marker, embers };
   }
   function makeEffect(effect: Effect) {
     const root = new TransformNode(`effect-${effect.id}`, scene);
     const pieces: Mesh[] = [];
+    const flare = effect.kind === 'blast' ? groundMarker('ember-impact-flare', BOSS_BLAST_RADIUS, '#ff6813', root, .60) : undefined;
     if (effect.kind === 'swing') {
       // This ribbon is re-shaped every frame so the bright arc really sweeps forward.
       for (let i = 0; i < 3; i++) {
@@ -761,16 +833,16 @@ export function createGameRenderer(canvas: HTMLCanvasElement) {
         pieces.push(ribbon);
       }
     } else {
-      const count = effect.kind === 'grass' ? 11 : effect.kind === 'poof' ? 10 : effect.kind === 'sparkle' ? 9 : 8;
-      const colors = effect.kind === 'grass' ? ['#b1bd66', '#7f9b4f', '#d3ca81'] : effect.kind === 'pot' ? ['#c99467', '#a56946', '#e0b47c'] : effect.kind === 'poof' ? ['#d8d7b5', '#adc3a2', '#ece7c3'] : ['#ffdfa3', '#ffffd2', '#c5df9b'];
+      const count = effect.kind === 'grass' ? 11 : effect.kind === 'poof' ? 10 : effect.kind === 'sparkle' ? 9 : effect.kind === 'blast' ? 10 : 8;
+      const colors = effect.kind === 'grass' ? ['#b1bd66', '#7f9b4f', '#d3ca81'] : effect.kind === 'pot' ? ['#c99467', '#a56946', '#e0b47c'] : effect.kind === 'poof' ? ['#d8d7b5', '#adc3a2', '#ece7c3'] : effect.kind === 'blast' ? ['#ff751b', '#ffc353', '#e33c13'] : ['#ffdfa3', '#ffffd2', '#c5df9b'];
       for (let i = 0; i < count; i++) {
-        const size = effect.kind === 'poof' ? .15 + random(i, 2) * .08 : .035 + random(i, 2) * .04;
-        const piece = rock('effect-particle', 0, .4, 0, size, effect.kind === 'grass' ? size * 2.4 : size, size, mat(`effect-${effect.kind}-${i % 3}`, colors[i % 3], effect.kind === 'hit' || effect.kind === 'sparkle' ? .6 : .08), root, false, false);
+        const size = effect.kind === 'poof' ? .15 + random(i, 2) * .08 : effect.kind === 'blast' ? .08 + random(i, 2) * .05 : .035 + random(i, 2) * .04;
+        const piece = rock('effect-particle', 0, .4, 0, size, effect.kind === 'grass' ? size * 2.4 : size, size, mat(`effect-${effect.kind}-${i % 3}`, colors[i % 3], effect.kind === 'blast' ? .55 : effect.kind === 'hit' || effect.kind === 'sparkle' ? .6 : .08), root, false, false);
         piece.metadata = { baseScale: piece.scaling.clone() };
         pieces.push(piece);
       }
     }
-    return { root, pieces, kind: effect.kind };
+    return { root, pieces, kind: effect.kind, flare };
   }
   function updateSweep(mesh: Mesh, start: number, end: number, radius: number, thickness: number, height: number, alpha: number) {
     const positions: number[] = [], indices: number[] = [], normals: number[] = [];
@@ -798,9 +870,10 @@ export function createGameRenderer(canvas: HTMLCanvasElement) {
     for (const v of enemyVisuals.values()) disposeVisual(v.root);
     for (const v of breakableVisuals.values()) disposeVisual(v);
     for (const v of pickupVisuals.values()) disposeVisual(v);
-    for (const v of projectileVisuals.values()) disposeVisual(v);
+    for (const v of projectileVisuals.values()) disposeVisual(v.root);
+    for (const v of hazardVisuals.values()) disposeVisual(v.root);
     for (const v of effectVisuals.values()) disposeVisual(v.root);
-    enemyVisuals.clear(); breakableVisuals.clear(); pickupVisuals.clear(); projectileVisuals.clear(); effectVisuals.clear();
+    enemyVisuals.clear(); breakableVisuals.clear(); pickupVisuals.clear(); projectileVisuals.clear(); hazardVisuals.clear(); effectVisuals.clear();
   }
   let cameraTarget = new Vector3(8, 0, 5);
   function updateActors(state: GameStore, dt: number) {
@@ -840,7 +913,9 @@ export function createGameRenderer(canvas: HTMLCanvasElement) {
       rightArm.rotationQuaternion = null;
       rightArm.rotation.setAll(0);
     }
+    const enemiesNow = new Set<string>();
     for (const enemy of state.enemies) {
+      enemiesNow.add(enemy.id);
       let visual = enemyVisuals.get(enemy.id);
       if (!visual) { visual = makeEnemy(enemy); enemyVisuals.set(enemy.id, visual); }
       visual.root.setEnabled(enemy.alive);
@@ -851,55 +926,99 @@ export function createGameRenderer(canvas: HTMLCanvasElement) {
       visual.body.position.y = Math.max(0, hop) * Math.min(.11, speed * .022);
       const shooting = enemy.attackMode === 'telegraph' || enemy.attackMode === 'fire';
       const charging = enemy.attackMode === 'chargeTelegraph';
+      const lunging = enemy.boss && enemy.attackMode === 'charge';
       const squish = Math.sin(clock * (shooting ? 20 : 7) + random(enemy.homeX, enemy.homeZ) * 6);
       visual.body.scaling.set(1 - squish * .034, 1 + squish * .052, 1 + squish * .016);
       visual.body.rotation.z = Math.sin(clock * 5.6 + random(enemy.homeX, enemy.homeZ) * 8) * .025;
       visual.body.material = enemy.flash > 0 ? flashMat : shooting
         ? mat('warden-spell-windup', '#dd728d', .23)
-        : charging ? mat('warden-charge-windup', '#d78481', .16)
+        : lunging ? mat('warden-charge-immune', '#ffbe6e', .8)
+        : charging ? mat('warden-charge-windup', '#e69762', .32)
         : enemy.boss && enemy.phase === 2 ? mat('warden-enraged', '#c13f78', .06) : visual.normal;
-      if (shooting || charging || enemy.attackMode === 'charge') {
-        visual.root.rotation.y = Math.atan2(enemy.aimX - enemy.x, enemy.aimZ - enemy.z) + Math.PI;
-      } else if (speed > .10) visual.root.rotation.y = Math.atan2(enemy.vx, enemy.vz) + Math.PI;
+      visual.root.rotation.y = getEnemyYaw(enemy);
       if (visual.tell) {
-        visual.tell.setEnabled(charging);
+        visual.tell.setEnabled(charging || lunging);
         const warningScale = 1 + Math.sin(clock * 19) * .055;
         visual.tell.scaling.set(warningScale, 1, warningScale);
         visual.tell.visibility = .65 + Math.sin(clock * 19) * .25;
       }
-      if (visual.aim && visual.line && visual.marker && visual.orb) {
-        visual.aim.setEnabled(shooting || charging);
-        visual.orb.setEnabled(shooting);
-        if (shooting || charging) {
+      if (visual.guard) {
+        visual.guard.setEnabled(lunging);
+        visual.guard.visibility = .65 + Math.sin(clock * 30) * .2;
+      }
+      if (visual.chargeAim && visual.corridor) {
+        visual.chargeAim.setEnabled(charging);
+        if (charging) {
           const dx = enemy.aimX - enemy.x, dz = enemy.aimZ - enemy.z;
-          const distance = charging ? Math.min(2.8, Math.hypot(dx, dz)) : Math.hypot(dx, dz);
+          visual.chargeAim.rotation.y = Math.atan2(dx, dz) - visual.root.rotation.y;
+          const progress = 1 - Math.min(1, enemy.attackTimer / BOSS_CHARGE_TELEGRAPH);
+          visual.corridor.visibility = .65 + progress * .35;
+          for (const arrow of visual.arrows ?? []) arrow.visibility = .65 + Math.sin(clock * 18 - arrow.position.z * 2) * .30;
+        }
+      }
+      if (visual.aim && visual.line && visual.orb) {
+        visual.aim.setEnabled(enemy.attackMode === 'telegraph');
+        visual.orb.setEnabled(shooting);
+        if (shooting) {
+          const dx = enemy.aimX - enemy.x, dz = enemy.aimZ - enemy.z;
+          const distance = Math.hypot(dx, dz);
           visual.aim.rotation.y = Math.atan2(dx, dz) - visual.root.rotation.y;
           visual.line.scaling.z = distance;
           visual.line.position.z = distance / 2;
-          visual.marker.position.z = distance;
-          const charge = 1 - Math.min(1, enemy.attackTimer / (charging ? .6 : .55));
+          const charge = 1 - Math.min(1, enemy.attackTimer / BOSS_TELEGRAPH);
           visual.orb.scaling.setAll(.65 + charge * .70);
-          visual.marker.scaling.setAll(1.2 - charge * .25);
-          visual.line.visibility = .45 + charge * .4;
-          for (const ray of visual.fan ?? []) {
-            ray.setEnabled(shooting && enemy.phase === 2);
-            ray.scaling.z = distance;
-            ray.position.set(Math.sin(ray.rotation.y) * distance / 2, .085, Math.cos(ray.rotation.y) * distance / 2);
-            ray.visibility = .35 + charge * .3;
+          visual.line.visibility = .18 + charge * .14;
+          for (const [i, marker] of (visual.targets ?? []).entries()) {
+            marker.root.setEnabled(i === 1 || enemy.phase === 2);
+            marker.root.position.set((i - 1) * BOSS_BLAST_SPREAD, 0, distance);
+            marker.fill.visibility = .45 + charge * .4;
+            marker.ring.visibility = .7 + Math.sin(clock * 17) * .2;
           }
         }
       }
     }
+    for (const [id, visual] of enemyVisuals) if (!enemiesNow.has(id)) { disposeVisual(visual.root); enemyVisuals.delete(id); }
     const projectilesNow = new Set<string>();
     for (const projectile of state.projectiles) {
       projectilesNow.add(projectile.id);
       let visual = projectileVisuals.get(projectile.id);
       if (!visual) { visual = makeProjectile(projectile); projectileVisuals.set(projectile.id, visual); }
-      visual.position.set(projectile.x, .59 + Math.sin(projectile.age * 13) * .035, projectile.z);
-      visual.rotation.y = Math.atan2(projectile.vx, projectile.vz);
-      visual.scaling.setAll(1 + Math.sin(projectile.age * 18) * .035);
+      const targeted = projectile.flightTime !== undefined && projectile.flightTime > 0 && projectile.startX !== undefined && projectile.startZ !== undefined && projectile.targetX !== undefined && projectile.targetZ !== undefined;
+      const progress = targeted ? Math.min(1, Math.max(0, projectile.age / projectile.flightTime!)) : 0;
+      const x = targeted ? projectile.startX! + (projectile.targetX! - projectile.startX!) * progress : projectile.x;
+      const z = targeted ? projectile.startZ! + (projectile.targetZ! - projectile.startZ!) * progress : projectile.z;
+      visual.root.position.set(x, 0, z);
+      visual.body.position.y = targeted ? .25 + .9 * (1 - progress) + Math.sin(progress * Math.PI) * 1.8 : .59 + Math.sin(projectile.age * 13) * .035;
+      visual.body.rotation.y = Math.atan2(projectile.vx, projectile.vz);
+      visual.body.scaling.setAll(1 + Math.sin(projectile.age * 18) * .035);
+      if (visual.landing && projectile.targetX !== undefined && projectile.targetZ !== undefined) {
+        visual.landing.root.position.set(projectile.targetX - x, 0, projectile.targetZ - z);
+        visual.landing.fill.visibility = .4 + progress * .5;
+        visual.landing.ring.visibility = .7 + Math.sin(clock * 19) * .2;
+      }
+      if (visual.shadow) visual.shadow.visibility = .6 + progress * .3;
     }
-    for (const [id, visual] of projectileVisuals) if (!projectilesNow.has(id)) { disposeVisual(visual); projectileVisuals.delete(id); }
+    for (const [id, visual] of projectileVisuals) if (!projectilesNow.has(id)) { disposeVisual(visual.root); projectileVisuals.delete(id); }
+    const hazardsNow = new Set<string>();
+    for (const hazard of state.hazards ?? []) {
+      hazardsNow.add(hazard.id);
+      let visual = hazardVisuals.get(hazard.id);
+      if (!visual) { visual = makeHazard(hazard); hazardVisuals.set(hazard.id, visual); }
+      visual.root.position.set(hazard.x, 0, hazard.z);
+      visual.root.scaling.set(hazard.radius, 1, hazard.radius);
+      const remaining = Math.min(1, Math.max(0, (hazard.duration - hazard.age) / .25));
+      visual.fill.visibility = remaining * (.75 + Math.sin(clock * 16) * .15);
+      visual.ring.visibility = remaining * (.8 + Math.sin(clock * 19) * .15);
+      for (let i = 0; i < visual.embers.length; i++) {
+        const ember = visual.embers[i];
+        const flicker = Math.sin(clock * 14 + i * 1.8);
+        ember.position.y = .24 + Math.max(0, flicker) * .06;
+        ember.scaling.y = .9 + flicker * .25;
+        ember.visibility = remaining;
+        ember.rotation.y = clock * 2 + i;
+      }
+    }
+    for (const [id, visual] of hazardVisuals) if (!hazardsNow.has(id)) { disposeVisual(visual.root); hazardVisuals.delete(id); }
     const breakablesNow = new Set<string>();
     for (const b of state.breakables) {
       breakablesNow.add(b.id);
@@ -934,11 +1053,17 @@ export function createGameRenderer(canvas: HTMLCanvasElement) {
         visual.root.position.x = state.player.x + Math.cos(state.player.facing) * sweep.advance;
         visual.root.position.z = state.player.z + Math.sin(state.player.facing) * sweep.advance;
       } else {
+        if (visual.flare) {
+          const radius = BOSS_BLAST_RADIUS * (.18 + progress * .82);
+          visual.flare.root.scaling.set(radius, 1, radius);
+          visual.flare.fill.visibility = Math.max(0, 1 - progress * 3);
+          visual.flare.ring.visibility = 1 - progress;
+        }
         for (let i = 0; i < visual.pieces.length; i++) {
           const piece = visual.pieces[i];
           const a = i / visual.pieces.length * 6.28 + effect.angle;
-          const distance = progress * (effect.kind === 'poof' ? .7 : .9 + random(i, 8) * .65);
-          piece.position.set(Math.cos(a) * distance, .28 + Math.sin(progress * Math.PI) * (.4 + random(i, 7) * .6), Math.sin(a) * distance);
+          const distance = progress * (effect.kind === 'poof' ? .7 : effect.kind === 'blast' ? .65 + random(i, 8) * .55 : .9 + random(i, 8) * .65);
+          piece.position.set(Math.cos(a) * distance, (effect.kind === 'blast' ? .15 : .28) + Math.sin(progress * Math.PI) * (.4 + random(i, 7) * .6), Math.sin(a) * distance);
           piece.visibility = 1 - progress;
           const scale = effect.kind === 'poof' ? 1 + progress * .9 : 1 - progress * .35;
           const base = piece.metadata.baseScale as Vector3;
@@ -968,7 +1093,18 @@ export function createGameRenderer(canvas: HTMLCanvasElement) {
     if (scene.isDisposed) return;
     clock += dt;
     const state = useGameStore.getState();
-    if (state.zone !== activeZone) { buildZone(state.zone); cameraTarget.set(state.player.x, 0, state.player.z); }
+    const zoneChanged = state.zone !== activeZone;
+    if (zoneChanged || state.tileOverrides[state.zone] !== activeTileOverrides) {
+      const gateHeight = gate?.position.y;
+      const chestAngle = chestLid?.rotation.x;
+      buildZone(state.zone, state.tileOverrides);
+      if (zoneChanged) cameraTarget.set(state.player.x, 0, state.player.z);
+      else {
+        // A tile edit should continue the gate and chest's current animation.
+        if (gate && gateHeight !== undefined) gate.position.y = gateHeight;
+        if (chestLid && chestAngle !== undefined) chestLid.rotation.x = chestAngle;
+      }
+    }
     updateActors(state, dt);
     const isTitle = state.status === 'title';
     titleCameraBlend += ((isTitle ? 1 : 0) - titleCameraBlend) * Math.min(1, dt * 2.6);

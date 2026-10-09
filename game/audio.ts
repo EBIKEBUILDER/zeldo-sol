@@ -1,9 +1,22 @@
-export type SoundName = 'swing' | 'hit' | 'death' | 'rupee' | 'hurt' | 'key' | 'gate' | 'chest' | 'warning' | 'fire';
+import { MUSIC_SCORES, type MusicNote, type MusicTrack } from './music';
+
+export type SoundName = 'swing' | 'hit' | 'death' | 'rupee' | 'hurt' | 'key' | 'gate' | 'chest' | 'warning' | 'fire' | 'blast';
 
 let context: AudioContext | null = null;
 let master: GainNode | null = null;
 let noiseBuffer: AudioBuffer | null = null;
 let muted = false;
+let requestedMusic: MusicTrack | null = null;
+let musicTimer: ReturnType<typeof setInterval> | null = null;
+type MusicPlayback = {
+  track: MusicTrack;
+  bus: GainNode;
+  sources: Set<AudioScheduledSourceNode>;
+  step: number;
+  nextTime: number;
+  retired: boolean;
+};
+let music: MusicPlayback | null = null;
 
 /** Call from a keyboard or pointer gesture; importing this module is SSR-safe. */
 export function unlockAudio(): void {
@@ -20,8 +33,10 @@ export function unlockAudio(): void {
       noiseBuffer = context.createBuffer(1, context.sampleRate / 2, context.sampleRate);
       const samples = noiseBuffer.getChannelData(0);
       for (let i = 0; i < samples.length; i++) samples[i] = Math.random() * 2 - 1;
+      context.onstatechange = syncMusicPlayback;
     }
-    if (context.state !== 'running') void context.resume().catch(() => {});
+    if (context.state !== 'running') void context.resume().then(syncMusicPlayback).catch(() => {});
+    else syncMusicPlayback();
   } catch {
     // An unavailable audio device must never prevent a game from starting.
   }
@@ -29,11 +44,149 @@ export function unlockAudio(): void {
 
 export function setAudioMuted(value: boolean): void {
   muted = value;
+  syncMusicPlayback();
   if (!context || !master) return;
   try {
     master.gain.cancelScheduledValues(context.currentTime);
     master.gain.setTargetAtTime(value ? 0 : 0.36, context.currentTime, 0.012);
   } catch {}
+}
+
+/** Select a theme freely; sound still starts only after unlockAudio's user gesture. */
+export function setMusicTrack(track: MusicTrack | null): void {
+  requestedMusic = track;
+  syncMusicPlayback();
+}
+
+function retireMusic(): void {
+  if (musicTimer !== null) clearInterval(musicTimer);
+  musicTimer = null;
+  const previous = music;
+  music = null;
+  if (!previous || !context) return;
+  previous.retired = true;
+  const now = context.currentTime;
+  try {
+    previous.bus.gain.cancelScheduledValues(now);
+    previous.bus.gain.setTargetAtTime(0, now, .06);
+  } catch {}
+  // Limit the tail, including notes already queued by the lookahead scheduler.
+  for (const source of previous.sources) {
+    try { source.stop(now + .3); } catch {}
+  }
+  if (!previous.sources.size) previous.bus.disconnect();
+}
+
+function syncMusicPlayback(): void {
+  if (!context || !master || context.state !== 'running' || muted || !requestedMusic) {
+    retireMusic();
+    return;
+  }
+  if (music?.track === requestedMusic) return;
+  try {
+    retireMusic();
+    const bus = context.createGain();
+    bus.gain.setValueAtTime(0, context.currentTime);
+    bus.gain.linearRampToValueAtTime(.8, context.currentTime + .45);
+    bus.connect(master);
+    music = { track: requestedMusic, bus, sources: new Set(), step: 0, nextTime: context.currentTime + .03, retired: false };
+    scheduleMusic();
+    musicTimer = setInterval(scheduleMusic, 40);
+  } catch {
+    retireMusic();
+  }
+}
+
+function connectMusicSource(playback: MusicPlayback, source: AudioScheduledSourceNode, envelope: GainNode, filter?: BiquadFilterNode): void {
+  playback.sources.add(source);
+  if (filter) { source.connect(filter); filter.connect(envelope); }
+  else source.connect(envelope);
+  envelope.connect(playback.bus);
+  source.onended = () => {
+    source.disconnect();
+    filter?.disconnect();
+    envelope.disconnect();
+    playback.sources.delete(source);
+    if (playback.retired && !playback.sources.size) playback.bus.disconnect();
+  };
+}
+
+function musicTone(playback: MusicPlayback, frequency: number, start: number, length: number, volume: number, voice: MusicNote['voice'], overtone = false): void {
+  if (!context) return;
+  const oscillator = context.createOscillator();
+  const envelope = context.createGain();
+  const filter = context.createBiquadFilter();
+  oscillator.type = overtone || voice === 'pad' ? 'sine' : playback.track === 'boss' && voice === 'bass' ? 'sawtooth' : 'triangle';
+  oscillator.frequency.setValueAtTime(frequency, start);
+  filter.type = 'lowpass';
+  filter.frequency.setValueAtTime(voice === 'bass' ? 650 : voice === 'pluck' ? 2200 : 3200, start);
+  const attack = voice === 'pad' ? Math.min(.22, length / 3) : .012;
+  const release = voice === 'pad' ? .3 : voice === 'pluck' ? .06 : .10;
+  envelope.gain.setValueAtTime(0, start);
+  envelope.gain.linearRampToValueAtTime(volume, start + attack);
+  envelope.gain.exponentialRampToValueAtTime(Math.max(.0001, volume * (voice === 'pluck' ? .12 : .65)), start + Math.max(attack + .001, length * .8));
+  envelope.gain.exponentialRampToValueAtTime(.0001, start + length + release);
+  connectMusicSource(playback, oscillator, envelope, filter);
+  oscillator.start(start);
+  oscillator.stop(start + length + release + .02);
+}
+
+function musicDrum(playback: MusicPlayback, kind: 'kick' | 'snare' | 'hat', start: number, volume: number): void {
+  if (!context || !noiseBuffer) return;
+  const envelope = context.createGain();
+  const length = kind === 'kick' ? .18 : kind === 'snare' ? .12 : .045;
+  envelope.gain.setValueAtTime(0, start);
+  envelope.gain.linearRampToValueAtTime(volume, start + .004);
+  envelope.gain.exponentialRampToValueAtTime(.0001, start + length);
+  if (kind === 'kick') {
+    const oscillator = context.createOscillator();
+    oscillator.type = 'sine';
+    oscillator.frequency.setValueAtTime(140, start);
+    oscillator.frequency.exponentialRampToValueAtTime(42, start + length);
+    connectMusicSource(playback, oscillator, envelope);
+    oscillator.start(start);
+    oscillator.stop(start + length + .02);
+  } else {
+    const source = context.createBufferSource();
+    const filter = context.createBiquadFilter();
+    source.buffer = noiseBuffer;
+    filter.type = kind === 'hat' ? 'highpass' : 'bandpass';
+    filter.frequency.setValueAtTime(kind === 'hat' ? 6500 : 1800, start);
+    filter.Q.value = .7;
+    connectMusicSource(playback, source, envelope, filter);
+    source.start(start);
+    source.stop(start + length + .02);
+  }
+}
+
+function scheduleMusic(): void {
+  if (!context || !music || muted || context.state !== 'running') {
+    retireMusic();
+    return;
+  }
+  try {
+    const playback = music;
+    const score = MUSIC_SCORES[playback.track];
+    const stepLength = 60 / score.bpm / 4;
+    const now = context.currentTime;
+    // A delayed timer resumes from now; it never dumps overdue notes in a burst.
+    if (playback.nextTime < now) playback.nextTime = now + .015;
+    while (playback.nextTime < now + .15) {
+      for (const note of score.notes) {
+        if (note.step !== playback.step) continue;
+        const frequency = 440 * 2 ** ((note.midi - 69) / 12);
+        musicTone(playback, frequency, playback.nextTime, note.length * stepLength, note.volume, note.voice);
+        if (note.voice === 'lead') musicTone(playback, frequency * 2, playback.nextTime, note.length * stepLength, note.volume * .15, note.voice, true);
+      }
+      for (const drum of score.percussion) {
+        if (drum.step === playback.step) musicDrum(playback, drum.kind, playback.nextTime, drum.volume);
+      }
+      playback.step = (playback.step + 1) % score.steps;
+      playback.nextTime += stepLength;
+    }
+  } catch {
+    retireMusic();
+  }
 }
 
 function tone(frequency: number, length: number, volume: number, delay = 0, type: OscillatorType = 'triangle', endFrequency = frequency): void {
@@ -87,6 +240,10 @@ export function playSound(name: SoundName): void {
   if (muted || !context || context.state !== 'running') return;
   try {
     switch (name) {
+      case 'blast':
+        noise(.32, .20, 2200);
+        tone(125, .28, .18, 0, 'sine', 32);
+        break;
       case 'warning':
         tone(180, 0.5, 0.18, 0, 'triangle', 720);
         tone(360, 0.43, 0.07, 0.06, 'sine', 1080);

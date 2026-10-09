@@ -312,6 +312,7 @@ test('normal movement and combat inputs complete the live adventure from home to
     assert.notEqual(data.status, 'gameover', `The hero died during normal gameplay: ${describe()}`);
   };
   const walk = (x: number, z: number) => {
+    const startingZone = data.zone;
     for (let attempt = 0; attempt < 3000; attempt++) {
       const dx = x - data.player.x;
       const dz = z - data.player.z;
@@ -323,6 +324,7 @@ test('normal movement and combat inputs complete the live adventure from home to
         attack: true,
         interact: false,
       });
+      if (data.zone !== startingZone) return;
     }
     assert.fail(`The live route to ${x}, ${z} is blocked: ${describe()}`);
   };
@@ -369,7 +371,6 @@ test('normal movement and combat inputs complete the live adventure from home to
   // This test changes state only through normal inputs: no entity fixtures,
   // teleports, health edits, or quest shortcuts are used during the adventure.
   for (const [x, z] of [[25, 5], [25, 20], [42, 20], [42, 27]]) walk(x, z);
-  interact();
   assert.equal(data.zone, 'dungeon');
   const guardian = data.enemies.find(enemy => enemy.boss);
   assert.equal(guardian?.maxHp, 12);

@@ -2,7 +2,7 @@ import type { Metadata, Viewport } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'ZELDO · Mosslight — The Hollow Crown',
+  title: 'ZELDO — The Hollow Crown',
   description: 'A small hero. A hidden dungeon. A forest waiting for its light. A complete, handcrafted 3D browser adventure.',
   icons: { icon: '/favicon.svg' },
 };

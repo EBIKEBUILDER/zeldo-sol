@@ -1,10 +1,12 @@
 'use client';
 
-import { memo, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import { memo, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { useGameStore } from '@/game/store';
-import { setAudioMuted, unlockAudio } from '@/game/audio';
-import { CHEST_POSITION, DUNGEON_ENTRANCE, FIXED_STEP, GATE_POSITION, KEY_POSITION, type GameInput, type Zone } from '@/game/types';
+import { setAudioMuted, setMusicTrack, unlockAudio } from '@/game/audio';
+import { getMusicTrack } from '@/game/music';
+import { attachPreviewSession } from '@/game/previewSession';
+import { CHEST_POSITION, DUNGEON_ENTRANCE, FIXED_STEP, GATE_POSITION, KEY_POSITION, type GameInput, type WorldData, type Zone } from '@/game/types';
 import { getWorld } from '@/game/world';
 import type { RenderStatistics } from '@/game/renderer';
 
@@ -57,6 +59,7 @@ function GameCanvas({ onReady, onError, blocked }: { onReady: () => void; onErro
     let interaction = false;
     let accumulator = 0;
     let previous = 0;
+    let consecutiveFrameErrors = 0;
     const keydown = (e: KeyboardEvent) => {
       const store = useGameStore.getState();
       const focusedButton = e.target instanceof HTMLElement && e.target.closest('button');
@@ -64,6 +67,7 @@ function GameCanvas({ onReady, onError, blocked }: { onReady: () => void; onErro
       if (e.repeat || e.code === 'Enter' && focusedButton) return;
       if (e.code === 'Enter' && !blockedInput.current && ['title', 'gameover', 'victory'].includes(store.status)) { begin(); return; }
       if (blockedInput.current || store.status !== 'playing') return;
+      if (['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'KeyE'].includes(e.code)) unlockAudio();
       // Space always belongs to combat during play, even after using a toolbar.
       if (e.code === 'Space' && focusedButton) focusedButton.blur();
       keys.add(e.code);
@@ -91,23 +95,40 @@ function GameCanvas({ onReady, onError, blocked }: { onReady: () => void; onErro
       onReady();
       const loop = (now: number) => {
         if (disposed) return;
-        const delta = previous ? Math.min((now - previous) / 1000, 0.12) : FIXED_STEP;
-        previous = now;
-        if (!document.hidden) {
-          accumulator = blockedInput.current ? 0 : accumulator + delta;
-          let ticks = 0;
-          while (accumulator >= FIXED_STEP && ticks++ < 8) {
-            const x = Number(keys.has('KeyD') || keys.has('ArrowRight')) - Number(keys.has('KeyA') || keys.has('ArrowLeft'));
-            const z = Number(keys.has('KeyW') || keys.has('ArrowUp')) - Number(keys.has('KeyS') || keys.has('ArrowDown'));
-            useGameStore.getState().tick(FIXED_STEP, { x: x || touch.x, z: z || touch.z, attack: keys.has('Space') || clickedAttack || touch.attack, interact: interaction || touch.interact });
-            clickedAttack = false; interaction = false; touch.interact = false;
-            accumulator -= FIXED_STEP;
-          }
-          if (ticks >= 8) accumulator = 0;
-          view?.render(delta);
-          renderMetrics.frames++;
-        }
+        // Reserve the next frame before work so one thrown update can recover.
         frame = requestAnimationFrame(loop);
+        try {
+          const delta = previous ? Math.min((now - previous) / 1000, 0.12) : FIXED_STEP;
+          previous = now;
+          if (!document.hidden) {
+            accumulator = blockedInput.current ? 0 : accumulator + delta;
+            let ticks = 0;
+            while (accumulator >= FIXED_STEP && ticks++ < 8) {
+              const x = Number(keys.has('KeyD') || keys.has('ArrowRight')) - Number(keys.has('KeyA') || keys.has('ArrowLeft'));
+              const z = Number(keys.has('KeyW') || keys.has('ArrowUp')) - Number(keys.has('KeyS') || keys.has('ArrowDown'));
+              useGameStore.getState().tick(FIXED_STEP, { x: x || touch.x, z: z || touch.z, attack: keys.has('Space') || clickedAttack || touch.attack, interact: interaction || touch.interact });
+              clickedAttack = false; interaction = false; touch.interact = false;
+              accumulator -= FIXED_STEP;
+            }
+            if (ticks >= 8) accumulator = 0;
+            view?.render(delta);
+            renderMetrics.frames++;
+            if (consecutiveFrameErrors > 0) onError('');
+            consecutiveFrameErrors = 0;
+          }
+        } catch (error: unknown) {
+          clear();
+          consecutiveFrameErrors++;
+          const message = error instanceof Error ? error.message : 'An unexpected update failed.';
+          if (consecutiveFrameErrors === 1) {
+            console.error('The adventure frame failed:', error);
+            onError(`The adventure hit an error: ${message}`);
+          }
+          if (consecutiveFrameErrors >= 3) {
+            cancelAnimationFrame(frame);
+            onError(`The adventure stopped after repeated errors: ${message}`);
+          }
+        }
       };
       frame = requestAnimationFrame(loop);
     }).catch((error: unknown) => onError(error instanceof Error ? error.message : 'Unable to create the 3D world.'));
@@ -130,42 +151,40 @@ function GameCanvas({ onReady, onError, blocked }: { onReady: () => void; onErro
   // The renderer is created once; callbacks only update React state.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  return <canvas ref={canvas} className="world-canvas" aria-label="ZELDO: Mosslight 3D adventure. Use WASD or the touch joystick to move, Space or the sword button to attack, and E or the hand button to interact." />;
+  return <canvas ref={canvas} className="world-canvas" aria-label="ZELDO 3D adventure. Use WASD or the touch joystick to move, Space or the sword button to attack, and E or the hand button to interact." />;
 }
 
-// Static terrain comes from the same tiles and colliders as the game. React only
-// redraws the moving map markers eight times a second, independently of rendering.
-const mapTerrain = (['overworld', 'dungeon'] as const).map(zone => {
-  const world = getWorld(zone);
+// Terrain updates with the game's tile state. React redraws moving map markers
+// eight times a second while the memoized terrain keeps its geometry stable.
+const MapTerrain = memo(function MapTerrain({ zone, world }: { zone: Zone; world: WorldData }) {
   const colors = { grass: '#4f7144', path: '#c8b381', water: '#3e929e', bridge: '#e5cb91', stone: zone === 'dungeon' ? '#657367' : '#849274' };
-  return [zone, <g key={zone}>
+  return <g>
     {Object.entries(colors).map(([kind, color]) => <path key={kind} fill={color} d={world.tiles.filter(tile => tile.kind === kind).map(tile => `M${tile.x - .5},${tile.z - .5}h1v1h-1Z`).join('')}/>)}
     {world.objects.filter(object => object.solid && object.kind !== 'gate').map(object => {
       const solid = object.solid!;
       const color = object.kind === 'tree' || object.kind === 'hedge' ? '#294b32' : object.kind === 'house' ? '#b57d4b' : '#33483c';
       return 'r' in solid ? <circle key={object.id} cx={object.x} cy={object.z} r={solid.r} fill={color}/> : <rect key={object.id} x={object.x - solid.w / 2} y={object.z - solid.d / 2} width={solid.w} height={solid.d} rx=".1" fill={color}/>;
     })}
-  </g>] as const;
+  </g>;
 });
-const MapTerrain = memo(function MapTerrain({ zone }: { zone: Zone }) { return mapTerrain.find(([name]) => name === zone)![1]; });
 
 function readMap() {
   const state = useGameStore.getState();
-  return { zone: state.zone, x: state.player.x, z: state.player.z, facing: state.player.facing, quest: { ...state.quest }, enemies: state.enemies.filter(enemy => enemy.alive).map(enemy => ({ id: enemy.id, x: enemy.x, z: enemy.z, boss: enemy.boss })), pots: state.breakables.filter(item => item.alive && item.kind === 'pot').map(item => ({ id: item.id, x: item.x, z: item.z })) };
+  return { zone: state.zone, tileOverrides: state.tileOverrides, x: state.player.x, z: state.player.z, facing: state.player.facing, quest: { ...state.quest }, enemies: state.enemies.filter(enemy => enemy.alive).map(enemy => ({ id: enemy.id, x: enemy.x, z: enemy.z, boss: enemy.boss })), pots: state.breakables.filter(item => item.alive && item.kind === 'pot').map(item => ({ id: item.id, x: item.x, z: item.z })) };
 }
 
 function MiniMap({ expanded = false }: { expanded?: boolean }) {
   const [state, setState] = useState(readMap);
   useEffect(() => { const timer = window.setInterval(() => setState(readMap()), 125); return () => window.clearInterval(timer); }, []);
-  const { x, z, zone, quest, enemies, pots, facing } = state;
-  const world = getWorld(zone);
+  const { x, z, zone, tileOverrides, quest, enemies, pots, facing } = state;
+  const world = useMemo(() => getWorld(zone, tileOverrides), [zone, tileOverrides]);
   const dungeon = zone === 'dungeon';
   const point = (position: { x: number; z: number }) => `translate(${position.x} ${position.z})`;
   return <div className={`minimap ${expanded ? 'expanded-map' : ''}`}>
     <div className="map-heading"><span>{dungeon ? 'THE HOLLOW' : 'LARKSPUR VALLEY'}</span><span>N ↑</span></div>
     <svg viewBox={`-.5 -.5 ${world.width} ${world.height}`} role="img" aria-label="Current area map: cream arrow is you, red dots are monsters, the orange crown is the boss, gold symbols mark the entrance, key, gate and treasure.">
       <g transform={`translate(0 ${world.height - 1}) scale(1 -1)`}>
-        <MapTerrain zone={zone}/>
+        <MapTerrain zone={zone} world={world}/>
         {pots.map(pot => <circle key={pot.id} cx={pot.x} cy={pot.z} r=".4" fill="#ab8562"/>)}
         {dungeon ? <>
           <g transform={point({ x: 12, z: 2 })}><title>Return to the valley</title><path d="M-.9-.65v1.2a.9.9 0 0 0 1.8 0v-1.2" stroke="#eee4bf" strokeWidth=".35" fill="#243f32"/></g>
@@ -226,14 +245,14 @@ function InteractionPrompt() {
   const label = useGameStore(s => {
     const p = s.player;
     const near = (v: { x: number; z: number }, distance: number) => Math.hypot(p.x - v.x, p.z - v.z) < distance;
-    if (s.zone === 'overworld' && near(DUNGEON_ENTRANCE, 2.2)) return 'Enter the Hollow';
-    if (s.zone === 'dungeon' && near({ x: 12, z: 2 }, 1.65)) return 'Return to the valley';
+    if (s.zone === 'overworld' && near(DUNGEON_ENTRANCE, 2.2)) return 'Walk into the Hollow';
+    if (s.zone === 'dungeon' && near({ x: 12, z: 2 }, 1.65)) return 'Walk out to the valley';
     if (s.zone === 'dungeon' && !s.quest.gate && !s.quest.key && near(GATE_POSITION, 3.15)) return 'The gate needs a key';
     if (s.zone === 'dungeon' && near(CHEST_POSITION, 2.15) && s.quest.boss) return 'Open the treasure';
     return '';
   });
   if (!label) return null;
-  return <div className="interaction-prompt glass">{label === 'The gate needs a key' ? <Icon name="key"/> : <><kbd className="keyboard-interact">E</kbd><Icon name="hand" className="touch-interact-icon"/></>}{label}</div>;
+  return <div className="interaction-prompt glass">{label === 'The gate needs a key' ? <Icon name="key"/> : label.startsWith('Walk ') ? <Icon name="arrow"/> : <><kbd className="keyboard-interact">E</kbd><Icon name="hand" className="touch-interact-icon"/></>}{label}</div>;
 }
 
 function Notice() {
@@ -298,7 +317,7 @@ function TouchControls() {
       event.preventDefault(); if (movePointer.current !== null) return;
       unlockAudio(); movePointer.current = event.pointerId; event.currentTarget.setPointerCapture(event.pointerId); event.currentTarget.classList.add('is-active'); move(event);
     }} onPointerMove={move} onPointerUp={releaseMove} onPointerCancel={releaseMove} onLostPointerCapture={releaseMove}><span className="joystick-cross"/><span ref={knob} className="joystick-knob"/></button><span className="touch-label">MOVE</span></div>
-    <div className="touch-actions"><button className="touch-key touch-interact" aria-label="Interact with doorway or treasure" onPointerDown={event => {
+    <div className="touch-actions"><button className="touch-key touch-interact" aria-label="Read signs or open treasure" onPointerDown={event => {
       event.preventDefault(); if (interactPointer.current !== null) return;
       interactPointer.current = event.pointerId; event.currentTarget.setPointerCapture(event.pointerId); unlockAudio(); emitInput({ interact: true });
     }} onPointerUp={releaseInteract} onPointerCancel={releaseInteract} onLostPointerCapture={releaseInteract}><Icon name="hand"/><span>ACT</span></button>
@@ -313,12 +332,30 @@ export default function Game() {
   const { status, muted } = useGameStore(useShallow(s => ({ status: s.status, muted: s.muted })));
   const [ready, setReady] = useState(false);
   const [error, setError] = useState('');
+  const [rendererGeneration, setRendererGeneration] = useState(0);
   const [help, setHelp] = useState(false);
   const [map, setMap] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
   const [fullscreenMessage, setFullscreenMessage] = useState('');
+  const [sessionReady, setSessionReady] = useState(process.env.NODE_ENV !== 'development');
   const title = status === 'title';
+  useEffect(() => {
+    const detach = attachPreviewSession(useGameStore);
+    setSessionReady(true);
+    return detach;
+  }, []);
   useEffect(() => { setAudioMuted(muted); }, [muted]);
+  useEffect(() => {
+    const syncMusic = () => setMusicTrack(getMusicTrack(useGameStore.getState(), help || map || !!error || document.hidden));
+    const unsubscribe = useGameStore.subscribe(syncMusic);
+    document.addEventListener('visibilitychange', syncMusic);
+    syncMusic();
+    return () => {
+      unsubscribe();
+      document.removeEventListener('visibilitychange', syncMusic);
+      setMusicTrack(null);
+    };
+  }, [help, map, error]);
   useEffect(() => {
     const listener = (e: KeyboardEvent) => {
       if (e.repeat) return;
@@ -346,8 +383,9 @@ export default function Game() {
     } catch { setFullscreenMessage('This browser could not open fullscreen. You can keep playing here.'); }
   };
   const toggleHelp = () => { setMap(false); setHelp(v => !v); };
+  if (!sessionReady) return <main className="game-shell"><div className="modal-backdrop"><section className="menu-card"><p>Loading your adventure…</p></section></div></main>;
   return <main className={`game-shell ${title ? 'is-title' : 'is-playing'} ${status === 'paused' ? 'is-paused' : ''}`}>
-    <GameCanvas onReady={() => setReady(true)} onError={setError} blocked={help || map}/>
+    <GameCanvas key={rendererGeneration} onReady={() => { setReady(true); setError(''); }} onError={setError} blocked={help || map}/>
     <div className="scene-vignette"/>
     {title && <div className="title-shade"/>}
     <header className="topbar">
@@ -363,7 +401,7 @@ export default function Game() {
     {title ? <>
       <section className="title-content">
         <div className="eyebrow"><span className="little-line"/> SOMEWHERE, BEYOND THE PINES</div>
-        <h1>Mosslight<span className="title-dot">.</span></h1>
+        <h1>ZELDO<span className="title-dot">.</span></h1>
         <div className="chapter"><span/>THE HOLLOW CROWN<span/></div>
         <p className="title-story">A little courage goes a long way.</p>
         <p className="title-description">Follow the winding paths of Larkspur Valley.<br/>Find the forgotten Hollow. Bring the forest’s light home.</p>
@@ -381,8 +419,9 @@ export default function Game() {
     </>}
     {status === 'paused' && !help && !map && <div className="modal-backdrop"><section className="menu-card"><div className="modal-emblem"><Icon name="leaf"/></div><div className="eyebrow">TAKE A BREATH</div><h2>The forest can wait.</h2><p>Your adventure is right where you left it.</p><button className="begin-button" onClick={() => useGameStore.getState().togglePause()}>CONTINUE ADVENTURE<Icon name="play"/></button><button className="text-button" onClick={() => setHelp(true)}>A little guidance</button></section></div>}
     {(status === 'gameover' || status === 'victory') && <EndScreen victory={status === 'victory'}/>}
-    {help && <div className="modal-backdrop"><section className="menu-card help-card"><button className="close-button" aria-label="Close instructions" onClick={() => setHelp(false)}><Icon name="close"/></button><div className="eyebrow">A LITTLE GUIDANCE</div><h2>Every hero starts small.</h2><div className="help-controls"><div><kbd>W A S D</kbd><p>Move through the valley.<br/>On touchscreens, drag the left joystick. A small drag walks slowly.</p></div><div><kbd>SPACE</kbd><p>Swing your sword.<br/>Use the right sword button on touchscreens. A click works, too.</p></div><div><kbd>E</kbd><p>Enter doorways and open treasure.<br/>Use the hand button on touchscreens. With the key, the gate opens as you approach.</p></div><div><kbd>M / ESC</kbd><p>Toggle sound / take a break.<br/>Tab or a tap on the minimap opens your map. The corner button toggles fullscreen.</p></div></div><p className="help-quest">Follow the path east, cross the little bridge, and head northeast to the stone arch. In the Hollow, find the key before facing its king. Cut grass and break pots for hearts and gems.</p><button className="begin-button" onClick={() => setHelp(false)}>GOT IT<Icon name="arrow"/></button></section></div>}
+    {help && <div className="modal-backdrop"><section className="menu-card help-card"><button className="close-button" aria-label="Close instructions" onClick={() => setHelp(false)}><Icon name="close"/></button><div className="eyebrow">A LITTLE GUIDANCE</div><h2>Every hero starts small.</h2><div className="help-controls"><div><kbd>W A S D</kbd><p>Move through the valley.<br/>On touchscreens, drag the left joystick. A small drag walks slowly.</p></div><div><kbd>SPACE</kbd><p>Swing your sword.<br/>Use the right sword button on touchscreens. A click works, too.</p></div><div><kbd>E</kbd><p>Read signs and open treasure.<br/>Walk into doorways to enter or leave. With the key, the gate opens as you approach.</p></div><div><kbd>M / ESC</kbd><p>Toggle sound / take a break.<br/>Tab or a tap on the minimap opens your map. The corner button toggles fullscreen.</p></div></div><p className="help-quest">Follow the path east, cross the little bridge, and head northeast to the stone arch. In the Hollow, find the key before facing its king. Dodge the orange lunge path and move clear of glowing ember pools. Cut grass and break pots for hearts and gems.</p><button className="begin-button" onClick={() => setHelp(false)}>GOT IT<Icon name="arrow"/></button></section></div>}
     {map && ['playing', 'paused'].includes(status) && <div className="modal-backdrop map-backdrop"><div className="map-overlay glass"><button className="close-button" aria-label="Close map" onClick={() => setMap(false)}><Icon name="close"/></button><div className="eyebrow">A LITTLE PERSPECTIVE</div><MiniMap expanded/></div></div>}
+    {!title && error && <div className="modal-backdrop"><section className="menu-card" role="alert"><h2>The world hit a snag.</h2><p>Your adventure is still here. Reload the view to continue.</p><p className="error-message">{error}</p><button className="begin-button" onClick={() => { setReady(false); setError(''); setRendererGeneration(value => value + 1); }}>CONTINUE ADVENTURE<Icon name="play"/></button></section></div>}
   </main>;
 }
 

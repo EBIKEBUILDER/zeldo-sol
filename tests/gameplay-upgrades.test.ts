@@ -140,14 +140,14 @@ test('boss melee cannot interrupt its tell, knock it away, or chain damage every
   data = stepGame(data, FIXED_STEP, { ...idle, attack: true }).data;
   assert.equal(data.enemies[0].hp, 11);
   assert.equal(data.enemies[0].hitstun, 0);
-  assert.equal(data.enemies[0].attackMode, 'telegraph');
+  assert.equal(data.enemies[0].attackMode, 'chargeTelegraph');
   assert.equal(data.enemies[0].vx, 0);
   assert.equal(data.enemies[0].vz, 0);
   assert.ok(data.enemies[0].damageCooldown > BOSS_DAMAGE_COOLDOWN - 0.02);
   data = advance(data, 0.45, { attack: true });
   assert.equal(data.enemies[0].hp, 11, 'A second rapid swing must respect the boss damage immunity');
   data = advance(data, 0.15, { attack: true });
-  assert.ok(data.projectiles.length > 0, 'The ranged attack must still fire while the player spams sword swings');
+  assert.equal(data.enemies[0].attackMode, 'charge', 'The nearby boss must still lunge while the player spams sword swings');
 });
 
 test('an engaged boss pressures the doorway and unreachable targets with magic through cover', () => {

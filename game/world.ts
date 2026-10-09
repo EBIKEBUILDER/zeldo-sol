@@ -1,15 +1,18 @@
 import {
   CHEST_POSITION,
   DUNGEON_ENTRANCE,
+  DUNGEON_SPAWN,
   GATE_POSITION,
   KEY_POSITION,
   type Breakable,
   type Enemy,
   type Tile,
+  type TileOverrides,
   type WorldData,
   type WorldObject,
   type Zone,
 } from './types';
+import type { NavigationPortal } from './pathfinding';
 
 const variation = (x: number, z: number) => {
   const n = Math.sin(x * 127.1 + z * 311.7) * 43758.5453;
@@ -101,7 +104,13 @@ function makeOverworld(): WorldData {
   }
   add({ kind: 'stump', x: 12.3, z: 25.4, scale: 0.85, solid: { r: 0.55 } });
   add({ kind: 'stump', x: 35, z: 11, scale: 0.75, solid: { r: 0.5 } });
-  return { width: 48, height: 32, tiles, objects };
+  // These are spatial/render chunks, not separate navigation rooms. Their
+  // origins address the same continuous 48×32 tile grid.
+  const chunks = Array.from({ length: 6 }, (_, index) => ({
+    id: `overworld-${index % 3}-${Math.floor(index / 3)}`, region: 'overworld' as const,
+    origin: { x: index % 3 * 16, z: Math.floor(index / 3) * 16 }, width: 16, height: 16,
+  }));
+  return { width: 48, height: 32, tiles, objects, chunks };
 }
 
 function makeDungeon(): WorldData {
@@ -135,22 +144,44 @@ function makeDungeon(): WorldData {
   }
   add({ kind: 'banner', x: 8.3, z: 33.6, rotation: 0.05, variant: 1 });
   add({ kind: 'banner', x: 15.7, z: 33.6, rotation: -0.05, variant: 1 });
-  return { width: 24, height: 36, tiles, objects };
+  return { width: 24, height: 36, tiles, objects, chunks: [{ id: 'dungeon', region: 'dungeon', origin: { x: 0, z: 0 }, width: 24, height: 36 }] };
 }
 
 const worlds: Record<Zone, WorldData> = { overworld: makeOverworld(), dungeon: makeDungeon() };
 
 /** Static, hand-placed world geometry. The simulation owns all mutable entities. */
-export const getWorld = (zone: Zone): WorldData => worlds[zone];
+export function getWorld(zone: Zone, overrides?: TileOverrides): WorldData {
+  const world = worlds[zone];
+  const changes = overrides?.[zone];
+  if (!changes || !Object.keys(changes).length) return world;
+  return { ...world, tiles: world.tiles.map(tile => {
+    const kind = changes[`${tile.x},${tile.z}`];
+    return kind && kind !== tile.kind ? { ...tile, kind } : tile;
+  }) };
+}
+
+/** Directed links use local chunk tiles. Edit each AI flag independently. */
+export const worldPortals: readonly NavigationPortal[] = [
+  {
+    id: 'dungeon-mouth', fromChunk: 'overworld-2-1',
+    fromTile: { x: DUNGEON_ENTRANCE.x - 32, z: DUNGEON_ENTRANCE.z - 16 },
+    toChunk: 'dungeon', toTile: { ...DUNGEON_SPAWN }, traversalCost: 1, traversableByAI: false, activationRadius: 2.2,
+  },
+  {
+    id: 'dungeon-exit', fromChunk: 'dungeon', fromTile: { x: 12, z: 2 },
+    toChunk: 'overworld-2-1', toTile: { x: DUNGEON_ENTRANCE.x - 32, z: DUNGEON_ENTRANCE.z - 18 },
+    traversalCost: 1, traversableByAI: false,
+  },
+];
 
 export function createEnemies(zone: Zone): Enemy[] {
   const placements = zone === 'overworld'
     ? [[17, 5], [21, 10], [31, 6], [42, 10], [8, 23], [18, 20], [28, 23], [34, 20], [41, 24]]
-    : [[14, 10], [18, 14], [8, 23], [17, 24], [12, 27]];
+    : [[14, 10], [18, 14], [8, 23], [17, 24], [9, 8], [12, 27]];
   return placements.map(([x, z], i) => {
     const boss = zone === 'dungeon' && i === placements.length - 1;
     return {
-      id: `${zone}-${boss ? 'boss' : 'blob'}-${i}`, x, z, homeX: x, homeZ: z, vx: 0, vz: 0,
+      id: `${zone}-${boss ? 'boss' : 'blob'}-${i}`, x, z, homeX: x, homeZ: z, homeZone: zone, vx: 0, vz: 0, facing: -Math.PI / 2,
       hp: boss ? 12 : 2, maxHp: boss ? 12 : 2, alive: true, boss,
       hitstun: 0, flash: 0, contactCooldown: 0, respawn: 0,
       wanderAngle: i * 2.399, wanderTime: 1 + i * 0.15, lastAttack: -4,
